@@ -28,6 +28,8 @@ strava/
 ### 1. Install dependencies
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -68,13 +70,13 @@ crontab -e
 ```
 
 ```
-*/10 * * * * cd /path/to/strava && /usr/bin/python3 sync.py
+*/10 * * * * cd /path/to/strava-grafana-dashboard && .venv/bin/python sync.py
 ```
 
 Redirect stdout/stderr to the log if you want cron to stay silent:
 
 ```
-*/10 * * * * cd /path/to/strava && /usr/bin/python3 sync.py >> sync.log 2>&1
+*/10 * * * * cd /path/to/strava-grafana-dashboard && .venv/bin/python sync.py >> sync.log 2>&1
 ```
 
 ---

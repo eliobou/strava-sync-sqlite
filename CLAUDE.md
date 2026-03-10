@@ -25,17 +25,19 @@ Syncs Strava activity history to a local SQLite database and serves it to a Graf
 ## Essential commands
 
 ```bash
-# Install dependencies
+# Install dependencies (Debian/Raspberry Pi — requires virtualenv)
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
 # Get initial OAuth refresh token (run once)
-python auth.py
+.venv/bin/python auth.py
 
 # Run a sync manually
-python sync.py
+.venv/bin/python sync.py
 
 # Cron entry (every 10 minutes)
-*/10 * * * * cd /path/to/strava && /usr/bin/python3 sync.py
+*/10 * * * * cd /path/to/strava-grafana-dashboard && .venv/bin/python sync.py
 ```
 
 ## Database tables
