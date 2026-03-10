@@ -263,14 +263,23 @@ services:
     ports:
       - "3030:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
-      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_SECURITY_ADMIN_USER=user
+      - GF_SECURITY_ADMIN_PASSWORD=password
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
     volumes:
       # Persistent Grafana data (dashboards, users, config)
       - ./data:/var/lib/grafana
       # Mount your SQLite file (read-only)
-      - /path/to/strava-grafana-dashboard/strava.db:/var/lib/grafana/strava.db:ro
+      - /path/to/strava-grafana-dashboard/:/data/strava
+```
+
+ Put the correct permission to the directory :
+```bash
+sudo chown -R pi:pi /home/pi/strava-grafana-dashboard/
+sudo chmod -R 775 /home/pi/strava-grafana-dashboard/
+mkdir -p ~/grafana/data
+sudo chown -R 472:root ~/grafana/data
+docker compose up -d
 ```
 
 If the plugin is already installed in your Grafana image, remove the `GF_INSTALL_PLUGINS` line.
@@ -279,7 +288,7 @@ If the plugin is already installed in your Grafana image, remove the `GF_INSTALL
 
 In Grafana → Connections → Data Sources → Add → SQLite:
 
-- **Path**: `/var/lib/grafana/strava.db`
+- **Path**: `/data/strava/strava.db`
 
 ### Example queries
 
