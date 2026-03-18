@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Strava → SQLite sync script.
-Designed to run via cron every 10 minutes.
+Designed to run via cron every 15 minutes.
 
-Strategy:
-- Every run: incremental sync (activities updated since last sync)
-- Every 24h: full sync to detect deletions
+Strategy: always full sync (fetch all activities, detect deletions).
+Strava API budget: ~3 requests per run × 96 runs/day = 288 requests/day (limit: 1000/day).
 """
 
 import json
@@ -31,7 +30,6 @@ ENV_PATH = BASE_DIR / ".env"
 STRAVA_API_BASE = "https://www.strava.com/api/v3"
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 PER_PAGE = 200
-FULL_SYNC_INTERVAL_HOURS = 1
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -117,7 +115,6 @@ CREATE TABLE IF NOT EXISTS activity_tracks (
 
 CREATE TABLE IF NOT EXISTS sync_log (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    sync_type            TEXT,
     started_at           TEXT,
     completed_at         TEXT,
     activities_added     INTEGER DEFAULT 0,
@@ -170,7 +167,6 @@ def set_config(conn: sqlite3.Connection, key: str, value) -> None:
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-
 
 def load_env_credentials():
     load_dotenv(ENV_PATH)
@@ -233,7 +229,6 @@ def get_access_token(
 
 # ── Strava API client ─────────────────────────────────────────────────────────
 
-
 class StravaClient:
     def __init__(self, access_token: str) -> None:
         self.session = requests.Session()
@@ -258,17 +253,13 @@ class StravaClient:
 
         return resp.json()
 
-    def get_all_activities(self, after: float | None = None) -> list[dict]:
+    def get_all_activities(self) -> list[dict]:
         """Fetch all activities, paginating as needed."""
         activities = []
         page = 1
         while True:
             log.info("Fetching activities page %d...", page)
-            params = {"per_page": PER_PAGE, "page": page}
-            if after is not None:
-                params["after"] = int(after)
-
-            batch = self._get("/athlete/activities", **params)
+            batch = self._get("/athlete/activities", per_page=PER_PAGE, page=page)
             if not batch:
                 break
 
@@ -285,7 +276,6 @@ class StravaClient:
 
 
 # ── Data mapping ──────────────────────────────────────────────────────────────
-
 
 def activity_to_row(a: dict) -> dict:
     """Map a Strava activity dict to a flat DB row dict."""
@@ -401,34 +391,19 @@ def upsert_activity(conn: sqlite3.Connection, activity_data: dict) -> str:
     return "updated"
 
 
-# ── Sync orchestration ────────────────────────────────────────────────────────
+# ── Sync ──────────────────────────────────────────────────────────────────────
 
-
-def sync_activities(
-    conn: sqlite3.Connection,
-    client: StravaClient,
-    *,
-    full: bool,
-) -> tuple[int, int, int]:
+def sync(conn: sqlite3.Connection, client: StravaClient) -> tuple[int, int, int]:
     """
-    Fetch and upsert activities.
+    Fetch all activities from Strava and upsert into the database.
+    Detects deletions by comparing Strava IDs with the local database.
     Returns (added, updated, deleted).
     """
-    if full:
-        log.info("Full sync: fetching all activities...")
-        activities = client.get_all_activities()
-    else:
-        last_sync = get_config(conn, "last_sync_timestamp")
-        after = float(last_sync) if last_sync else None
-        log.info(
-            "Incremental sync since %s",
-            datetime.fromtimestamp(after).isoformat() if after else "beginning",
-        )
-        activities = client.get_all_activities(after=after)
-
+    log.info("Fetching all activities from Strava...")
+    activities = client.get_all_activities()
     log.info("Processing %d activities...", len(activities))
-    added = updated = 0
 
+    added = updated = 0
     for a in activities:
         result = upsert_activity(conn, a)
         if result == "added":
@@ -436,74 +411,54 @@ def sync_activities(
         else:
             updated += 1
 
-    # Detect deletions only on full sync
-    deleted = 0
-    if full:
-        strava_ids = {a["id"] for a in activities}
-        db_ids = {
-            row[0]
-            for row in conn.execute(
-                "SELECT id FROM activities WHERE is_deleted = 0"
-            ).fetchall()
-        }
-        gone = db_ids - strava_ids
-        if gone:
-            now = datetime.now(timezone.utc).isoformat()
-            conn.executemany(
-                "UPDATE activities SET is_deleted = 1, updated_at = ? WHERE id = ?",
-                [(now, aid) for aid in gone],
-            )
-            deleted = len(gone)
-            log.info("Marked %d activities as deleted", deleted)
+    # Detect deletions: any local activity not returned by Strava is gone
+    strava_ids = {a["id"] for a in activities}
+    db_ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM activities WHERE is_deleted = 0"
+        ).fetchall()
+    }
+    gone = db_ids - strava_ids
+    if gone:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            "UPDATE activities SET is_deleted = 1, updated_at = ? WHERE id = ?",
+            [(now, aid) for aid in gone],
+        )
+        log.info("Marked %d activities as deleted", len(gone))
 
-    return added, updated, deleted
-
-
-def needs_full_sync(conn: sqlite3.Connection) -> bool:
-    last_full = get_config(conn, "last_full_sync_timestamp")
-    if not last_full:
-        return True
-    hours_since = (time.time() - float(last_full)) / 3600
-    return hours_since >= FULL_SYNC_INTERVAL_HOURS
+    return added, updated, len(gone)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
 
 def main() -> None:
     init_db()
 
     client_id, client_secret, initial_refresh_token = load_env_credentials()
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    log.info("=== Starting sync ===")
 
     with get_db() as conn:
-        access_token = get_access_token(
-            conn, client_id, client_secret, initial_refresh_token
-        )
-        client = StravaClient(access_token)
-
-        do_full = needs_full_sync(conn)
-        sync_type = "full" if do_full else "incremental"
-        started_at = datetime.now(timezone.utc).isoformat()
-
-        log.info("=== Starting %s sync ===", sync_type)
-
         try:
-            added, updated, deleted = sync_activities(
-                conn, client, full=do_full
-            )
+            access_token = get_access_token(conn, client_id, client_secret, initial_refresh_token)
+            client = StravaClient(access_token)
 
-            now_ts = time.time()
-            set_config(conn, "last_sync_timestamp", now_ts)
-            if do_full:
-                set_config(conn, "last_full_sync_timestamp", now_ts)
+            added, updated, deleted = sync(conn, client)
 
-            completed_at = datetime.now(timezone.utc).isoformat()
             conn.execute(
                 """INSERT INTO sync_log
-                   (sync_type, started_at, completed_at,
+                   (started_at, completed_at,
                     activities_added, activities_updated, activities_deleted, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (sync_type, started_at, completed_at, added, updated, deleted, "success"),
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    started_at,
+                    datetime.now(timezone.utc).isoformat(),
+                    added, updated, deleted,
+                    "success",
+                ),
             )
             conn.commit()
             log.info(
@@ -515,10 +470,9 @@ def main() -> None:
             conn.rollback()
             conn.execute(
                 """INSERT INTO sync_log
-                   (sync_type, started_at, completed_at, status, error_message)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (started_at, completed_at, status, error_message)
+                   VALUES (?, ?, ?, ?)""",
                 (
-                    sync_type,
                     started_at,
                     datetime.now(timezone.utc).isoformat(),
                     "error",
