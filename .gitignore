@@ -1,6 +1,11 @@
 .env
-strava.db
-sync.log
+
+*.db
+*.db-shm
+*.db-wal
+
+*.log
+
 __pycache__/
 *.pyc
 *.pyo
