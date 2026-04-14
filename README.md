@@ -1,31 +1,40 @@
-# Strava → SQLite → Grafana
+# Strava Sync — Grafana dashboard + GeoVelo upload
 
-Syncs all Strava activities to a local SQLite database and exposes the data to a Grafana dashboard via the SQLite datasource plugin.
+Two independent Python tools that sync your Strava activity history to a local SQLite database, then expose it to other services.
 
-## Overview
+| Feature | What it does | Script |
+|---|---|---|
+| **Strava → Grafana** | Syncs all activities to SQLite, visualize with a Grafana dashboard | `sync.py` |
+| **Strava → GeoVelo** | Auto-uploads Ride activities as GPX to your GeoVelo account | `geovelo_sync.py` |
 
-`sync.py` runs on a cron schedule and pulls activity data from the Strava API v3. It stores every field available from the activity summary endpoint, decodes GPS polylines into individual lat/lng points, and handles updates and deletions. Grafana reads directly from the SQLite file.
+Both tools share the same `strava.db` database and run on independent cron schedules. You can use one, the other, or both.
 
 ---
 
 ## Project structure
 
 ```
-strava/
-├── sync.py          # Main sync script (cron entry point)
-├── auth.py          # One-time OAuth helper to get the initial refresh token
+├── sync.py                  # Strava → SQLite (cron entry point)
+├── auth.py                  # One-time OAuth helper to get the initial refresh token
+├── geovelo_sync.py          # SQLite → GeoVelo (independent cron)
+├── geovelo_init_db.py       # One-time migration to enable GeoVelo feature
 ├── requirements.txt
-├── .env             # Credentials (not committed)
-├── .env.example     # Template
-├── strava.db        # SQLite database (auto-created on first run)
-└── sync.log         # Appended by every run
+├── .env                     # All credentials (not committed)
+├── .env.example             # Template — Strava + GeoVelo
+├── strava.db                # SQLite database (auto-created on first run)
+├── sync.log                 # Appended by every Strava sync run
+└── geovelo_sync.log         # Appended by every GeoVelo sync run
 ```
 
 ---
 
-## Setup
+## Feature 1 — Strava → Grafana
 
-### 1. Install dependencies
+`sync.py` runs on a cron schedule and pulls activity data from the Strava API v3. It stores every field available from the activity summary endpoint, decodes GPS polylines into individual lat/lng points, and handles updates and deletions. Grafana reads directly from the SQLite file.
+
+### Setup
+
+#### 1. Install dependencies
 
 ```bash
 python3 -m venv .venv
@@ -35,7 +44,7 @@ pip install -r requirements.txt
 
 Dependencies: `requests`, `python-dotenv`, `polyline`
 
-### 2. Create `.env`
+#### 2. Create `.env`
 
 ```bash
 cp .env.example .env
@@ -43,7 +52,7 @@ cp .env.example .env
 
 Fill in `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` from [strava.com/settings/api](https://www.strava.com/settings/api).
 
-### 3. Get the refresh token (once)
+#### 3. Get the refresh token (once)
 
 ```bash
 python auth.py
@@ -55,7 +64,7 @@ Required OAuth scope: `read_all,activity:read_all`
 
 After the first successful `sync.py` run, the token is stored and rotated automatically in the SQLite `config` table. The `.env` value is only used as a bootstrap fallback if the DB has no token yet.
 
-### 4. First run
+#### 4. First run
 
 ```bash
 python sync.py
@@ -63,86 +72,78 @@ python sync.py
 
 On first run: no `last_full_sync_timestamp` in the DB → triggers a full sync fetching all historical activities.
 
-### 5. Cron (Debian)
+#### 5. Cron (Debian / Raspberry Pi)
 
 ```bash
 crontab -e
 ```
 
 ```
-*/10 * * * * cd /path/to/strava-grafana-dashboard && .venv/bin/python sync.py
-```
-
-Redirect stdout/stderr to the log if you want cron to stay silent:
-
-```
-*/10 * * * * cd /path/to/strava-grafana-dashboard && .venv/bin/python sync.py >> sync.log 2>&1
+*/10 * * * * cd /path/to/repo && .venv/bin/python sync.py >> sync.log 2>&1
 ```
 
 ---
 
-## Sync logic
+### Sync logic
 
-### Two sync modes
+#### Two sync modes
 
 | Mode | Trigger | API calls | What it does |
 |---|---|---|---|
-| **Full** | First run ever, or `>= 24h` since last full | 1 per 200 activities (paginated) | Fetches all activities, upserts everything, detects deletions |
+| **Full** | First run ever, or `>= 1h` since last full | 1 per 200 activities (paginated) | Fetches all activities, upserts everything, detects deletions |
 | **Incremental** | Every other run | 1 (usually) | Fetches only activities updated since `last_sync_timestamp` |
 
-The decision is made at startup by checking `last_full_sync_timestamp` in the `config` table. If it is absent or older than `FULL_SYNC_INTERVAL_HOURS` (default: 1), a full sync runs.
+The decision is made at startup by checking `last_full_sync_timestamp` in the `config` table.
 
-### Incremental sync detail
+#### Incremental sync detail
 
 Uses the Strava API `after` parameter (Unix timestamp) on `GET /athlete/activities`. Only activities created or updated after the last sync timestamp are returned. This is typically 0–few activities per run → 1 API call.
 
-### Full sync and deletion detection
+#### Full sync and deletion detection
 
 Fetches all pages (200 per page). Builds the set of all Strava activity IDs. Compares with all non-deleted IDs in the DB. Any ID present in the DB but absent from Strava is marked `is_deleted = 1`. Activities are never physically deleted from the DB.
 
-### Upsert logic
+#### Upsert logic
 
 For each fetched activity:
 - If the ID is not in the DB → `INSERT` + decode and store track points
 - If the ID exists → `UPDATE` all fields; re-decode track points only if `map_summary_polyline` changed
 
-### Token rotation
+#### Token rotation
 
 Strava rotates the refresh token on every use. The new `access_token`, `refresh_token`, and `expires_at` are always written back to the `config` table immediately after refresh. The access token is reused across runs until it expires (with a 60-second safety margin).
 
-### Rate limits
+#### Rate limits
 
 Strava enforces **100 requests / 15 min** and **1 000 requests / day**.
 
 Estimated usage with this setup:
 - 10-min cron = 144 runs/day
-- Incremental runs: 1 call each → 138 calls/day
-- 24 full syncs/day (every hour): ~3 calls each → ~72 calls/day
+- Incremental runs: 1 call each → ~138 calls/day
+- Full syncs (every hour): ~3 calls each → ~72 calls/day
 - **Total: ~210 calls/day** — well within the 1 000/day limit
 
 On HTTP 429, the script reads the `X-RateLimit-Reset` header and sleeps until the window resets before retrying once.
 
 ---
 
-## Polyline decoding
+### Polyline decoding
 
-Strava returns a `summary_polyline` field (Google Encoded Polyline format) inside the `map` object of each activity. This is a compact string encoding of the GPS track.
-
-`sync.py` decodes it using the `polyline` Python library (`polyline.decode()`), which returns a list of `(lat, lng)` tuples. Each tuple is stored as a row in the `activity_tracks` table with its sequential `point_order`.
+Strava returns a `summary_polyline` field (Google Encoded Polyline format) inside the `map` object of each activity. `sync.py` decodes it using the `polyline` Python library, storing each point as a row in `activity_tracks`.
 
 This happens **without any extra API call** — the polyline is already included in the `/athlete/activities` response.
 
-Indoor activities and manual entries without GPS have an empty or null polyline; the decode step is skipped and no rows are inserted for those activities.
+Indoor activities and manual entries without GPS have an empty or null polyline; the decode step is skipped for those.
 
 ---
 
-## Database schema
+### Database schema
 
 SQLite file: `strava.db` (WAL mode, foreign keys enabled)
 
-### `activities`
+#### `activities`
 
-One row per Strava activity. All fields sourced from `GET /athlete/activities` (summary representation).
+One row per Strava activity. All fields sourced from `GET /athlete/activities`.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -202,7 +203,7 @@ One row per Strava activity. All fields sourced from `GET /athlete/activities` (
 
 Indexes: `start_date`, `sport_type`, `is_deleted`
 
-### `activity_tracks`
+#### `activity_tracks`
 
 Decoded GPS points from `map_summary_polyline`. One row per point.
 
@@ -215,9 +216,7 @@ Decoded GPS points from `map_summary_polyline`. One row per point.
 
 Primary key: `(activity_id, point_order)`
 
-Index: `activity_id`
-
-### `sync_log`
+#### `sync_log`
 
 One row per sync run.
 
@@ -232,7 +231,7 @@ One row per sync run.
 | `status` | `success` or `error` |
 | `error_message` | Populated on error |
 
-### `config`
+#### `config`
 
 Key/value store for runtime state.
 
@@ -246,9 +245,9 @@ Key/value store for runtime state.
 
 ---
 
-## Grafana setup
+### Grafana setup
 
-### Docker volume
+#### Docker volume
 
 The Grafana container needs read access to `strava.db`. Mount it as a volume.
 
@@ -267,13 +266,12 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=password
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
     volumes:
-      # Persistent Grafana data (dashboards, users, config)
       - ./data:/var/lib/grafana
-      # Mount your SQLite file (read-only)
-      - /path/to/strava-grafana-dashboard/:/data/strava
+      - /path/to/repo/:/data/strava
 ```
 
- Put the correct permission to the directory :
+Set permissions:
+
 ```bash
 sudo chown -R pi:pi /home/pi/strava-grafana-dashboard/
 sudo chmod -R 775 /home/pi/strava-grafana-dashboard/
@@ -282,17 +280,15 @@ sudo chown -R 472:root ~/grafana/data
 docker compose up -d
 ```
 
-If the plugin is already installed in your Grafana image, remove the `GF_INSTALL_PLUGINS` line.
-
-### Datasource configuration
+#### Datasource configuration
 
 In Grafana → Connections → Data Sources → Add → SQLite:
 
 - **Path**: `/data/strava/strava.db`
 
-### Example queries
+#### Example queries
 
-**All GPS track points (for Geomap / heatmap overlay)**
+**All GPS track points (Geomap / heatmap)**
 
 ```sql
 SELECT t.lat, t.lng
@@ -301,7 +297,7 @@ JOIN activities a ON a.id = t.activity_id
 WHERE a.is_deleted = 0
 ```
 
-**All GPS track points for a specific sport**
+**GPS points for a specific sport**
 
 ```sql
 SELECT t.lat, t.lng
@@ -340,10 +336,10 @@ ORDER BY month
 
 ```sql
 SELECT
-    strftime('%Y-W%W', start_date_local)        AS week,
-    ROUND(SUM(distance) / 1000.0, 2)            AS distance_km,
-    ROUND(SUM(total_elevation_gain), 0)         AS elevation_m,
-    ROUND(SUM(moving_time) / 3600.0, 2)         AS moving_hours
+    strftime('%Y-W%W', start_date_local)  AS week,
+    ROUND(SUM(distance) / 1000.0, 2)      AS distance_km,
+    ROUND(SUM(total_elevation_gain), 0)   AS elevation_m,
+    ROUND(SUM(moving_time) / 3600.0, 2)  AS moving_hours
 FROM activities
 WHERE is_deleted = 0
 GROUP BY week
@@ -369,9 +365,71 @@ ORDER BY id DESC
 LIMIT 20
 ```
 
-### Geomap panel tip
+#### Geomap panel tip
 
-In the Geomap panel, use **Table** query type. Set location mode to **Auto** with `lat` and `lng` as the coordinate columns. To overlay all tracks as a heatmap, use the Heatmap layer type with the all-points query above. Point density will naturally be higher on frequently ridden/run routes.
+In the Geomap panel, use **Table** query type. Set location mode to **Auto** with `lat` and `lng` as the coordinate columns. To overlay all tracks as a heatmap, use the Heatmap layer type with the all-points query above.
+
+---
+
+## Feature 2 — Strava → GeoVelo
+
+`geovelo_sync.py` reads `Ride` activities from `strava.db` and uploads them as GPX files to your GeoVelo account. It tracks which activities have already been uploaded so it never creates duplicates.
+
+Activities without GPS data (indoor trainer, manual entries) are silently skipped.
+
+### Setup
+
+#### 1. Create the GeoVelo table (once)
+
+```bash
+.venv/bin/python geovelo_init_db.py
+```
+
+This adds a `geovelo_uploads` table to the existing `strava.db`.
+
+#### 2. Add GeoVelo credentials to `.env`
+
+The GeoVelo variables are already in `.env.example`. Fill in `GEOVELO_AUTHENTIFICATION` — it is the base64 encoding of `your_email;your_password`:
+
+```bash
+python -c "import base64; print(base64.b64encode(b'email@example.com;yourpassword').decode())"
+```
+
+#### 3. First run
+
+On first run, all historical `Ride` activities already in the database will be uploaded.
+
+```bash
+.venv/bin/python geovelo_sync.py
+```
+
+#### 4. Cron
+
+```bash
+crontab -e
+```
+
+```
+*/5 * * * * cd /path/to/repo && .venv/bin/python geovelo_sync.py >> geovelo_sync.log 2>&1
+```
+
+Most runs will be instant no-ops (no new rides to upload).
+
+### GeoVelo API notes
+
+- Authentication: `POST /api/v1/authentication/geovelo` with `Authentication: base64("email;password")` header
+- Upload: `POST /api/v2/user_trace_from_gpx` — multipart form with `gpx` (file) and `title` fields
+- Each uploaded trace appears in your GeoVelo profile under **Mes trajets** (may take a few minutes to process)
+- GPX timestamps are synthesized from the activity's `elapsed_time` and distributed evenly across GPS points
+
+### `geovelo_uploads` table
+
+| Column | Notes |
+|---|---|
+| `activity_id` | FK → `activities.id` |
+| `uploaded_at` | ISO 8601 UTC |
+| `status` | `success`, `skipped` (no GPS), or `error` |
+| `error_msg` | Populated on error |
 
 ---
 
