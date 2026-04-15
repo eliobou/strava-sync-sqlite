@@ -86,22 +86,13 @@ crontab -e
 
 ### Sync logic
 
-#### Two sync modes
+#### Strategy: always full sync
 
-| Mode | Trigger | API calls | What it does |
-|---|---|---|---|
-| **Full** | First run ever, or `>= 1h` since last full | 1 per 200 activities (paginated) | Fetches all activities, upserts everything, detects deletions |
-| **Incremental** | Every other run | 1 (usually) | Fetches only activities updated since `last_sync_timestamp` |
+Every run fetches all activities from Strava (paginated, 200 per page) and upserts them into the database. This keeps the logic simple and guarantees deletion detection on every run.
 
-The decision is made at startup by checking `last_full_sync_timestamp` in the `config` table.
+#### Deletion detection
 
-#### Incremental sync detail
-
-Uses the Strava API `after` parameter (Unix timestamp) on `GET /athlete/activities`. Only activities created or updated after the last sync timestamp are returned. This is typically 0–few activities per run → 1 API call.
-
-#### Full sync and deletion detection
-
-Fetches all pages (200 per page). Builds the set of all Strava activity IDs. Compares with all non-deleted IDs in the DB. Any ID present in the DB but absent from Strava is marked `is_deleted = 1`. Activities are never physically deleted from the DB.
+After fetching, the set of Strava IDs is compared to all non-deleted IDs in the DB. Any ID present locally but absent from Strava is marked `is_deleted = 1`. Activities are never physically deleted from the DB.
 
 #### Upsert logic
 
@@ -117,11 +108,9 @@ Strava rotates the refresh token on every use. The new `access_token`, `refresh_
 
 Strava enforces **100 requests / 15 min** and **1 000 requests / day**.
 
-Estimated usage with this setup:
-- 10-min cron = 144 runs/day
-- Incremental runs: 1 call each → ~138 calls/day
-- Full syncs (every hour): ~3 calls each → ~72 calls/day
-- **Total: ~210 calls/day** — well within the 1 000/day limit
+Estimated usage with this setup (10-min cron, ~550 activities):
+- 144 runs/day × ~3 API calls each (3 pages of 200) = ~432 calls/day
+- **Well within the 1 000/day limit**
 
 On HTTP 429, the script reads the `X-RateLimit-Reset` header and sleeps until the window resets before retrying once.
 
@@ -240,8 +229,6 @@ Key/value store for runtime state.
 | `access_token` | Current Strava access token |
 | `refresh_token` | Current Strava refresh token (rotated after every use) |
 | `token_expires_at` | Unix timestamp |
-| `last_sync_timestamp` | Unix timestamp of last successful sync |
-| `last_full_sync_timestamp` | Unix timestamp of last full sync |
 
 ---
 
