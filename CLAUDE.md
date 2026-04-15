@@ -65,8 +65,7 @@ pip install -r requirements.txt
 ## Sync behaviour at a glance
 
 ### Strava → SQLite (`sync.py`)
-- **Incremental** (default): fetches only activities updated since `last_sync_timestamp` — 1 API call
-- **Full** (every 1h or first run): fetches all pages, detects deletions — ~3 API calls
+- **Always full sync**: fetches all activities every run (paginated, 200/page), upserts, detects deletions
 - Deleted activities are flagged `is_deleted = 1`, never physically removed
 
 ### SQLite → GeoVelo (`geovelo_sync.py`)

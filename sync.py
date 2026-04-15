@@ -362,12 +362,20 @@ def save_track_points(conn: sqlite3.Connection, activity_id: int, encoded: str |
         )
 
 
+# Fields that can change after an activity is created (social counters, user edits, etc.)
+_MUTABLE_FIELDS = (
+    "name", "kudos_count", "comment_count", "suffer_score",
+    "visibility", "has_kudoed", "achievement_count",
+    "photo_count", "total_photo_count", "map_summary_polyline",
+)
+
+
 def upsert_activity(conn: sqlite3.Connection, activity_data: dict) -> str:
-    """Upsert one activity. Returns 'added' or 'updated'."""
+    """Upsert one activity. Returns 'added', 'updated', or 'unchanged'."""
     row = activity_to_row(activity_data)
 
     existing = conn.execute(
-        "SELECT map_summary_polyline FROM activities WHERE id = ?",
+        f"SELECT {', '.join(_MUTABLE_FIELDS)} FROM activities WHERE id = ?",
         (row["id"],),
     ).fetchone()
 
@@ -380,6 +388,9 @@ def upsert_activity(conn: sqlite3.Connection, activity_data: dict) -> str:
         )
         save_track_points(conn, row["id"], row["map_summary_polyline"])
         return "added"
+
+    if all(existing[f] == row[f] for f in _MUTABLE_FIELDS):
+        return "unchanged"
 
     set_clause = ", ".join(f"{k} = ?" for k in row if k != "id")
     values = [v for k, v in row.items() if k != "id"] + [row["id"]]
@@ -408,7 +419,7 @@ def sync(conn: sqlite3.Connection, client: StravaClient) -> tuple[int, int, int]
         result = upsert_activity(conn, a)
         if result == "added":
             added += 1
-        else:
+        elif result == "updated":
             updated += 1
 
     # Detect deletions: any local activity not returned by Strava is gone
